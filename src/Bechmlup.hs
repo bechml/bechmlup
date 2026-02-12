@@ -15,6 +15,8 @@ import Options.Applicative
 import System.Directory
 import System.FilePath
 import System.Info
+import System.IO.Temp (withSystemTempDirectory)
+import System.Process (callProcess)
 
 -- | Tools managed by bechmlup
 data Tool = Bechml | Roux
@@ -140,6 +142,50 @@ downloadAsset asset dest = do
       "Download failed (" ++ show code ++ "): " ++ assetUrl asset
   BL.writeFile dest (responseBody resp)
 
+-- | Check if an asset name looks like an archive
+isArchive :: String -> Bool
+isArchive name =
+  ".tar.gz" `isSuffixOf` lname
+    || ".tgz" `isSuffixOf` lname
+    || ".zip" `isSuffixOf` lname
+  where
+    lname = map toLowerC name
+
+-- | Extract an archive into a directory
+extractArchive :: FilePath -> FilePath -> IO ()
+extractArchive archive destDir
+  | ".tar.gz" `isSuffixOf` lname || ".tgz" `isSuffixOf` lname =
+      callProcess "tar" ["xzf", archive, "-C", destDir]
+  | ".zip" `isSuffixOf` lname = do
+      -- Use tar on Windows (available in modern Windows), fallback-friendly
+      if os == "mingw32"
+        then callProcess "tar" ["xf", archive, "-C", destDir]
+        else callProcess "unzip" ["-o", "-q", archive, "-d", destDir]
+  | otherwise =
+      fail $ "Unknown archive format: " ++ archive
+  where
+    lname = map toLowerC archive
+
+-- | Recursively find a file by name in a directory
+findFileRecursive :: String -> FilePath -> IO (Maybe FilePath)
+findFileRecursive target dir = do
+  entries <- listDirectory dir
+  let check [] = pure Nothing
+      check (e : es) = do
+        let full = dir </> e
+        isDir <- doesDirectoryExist full
+        if isDir
+          then do
+            found <- findFileRecursive target full
+            case found of
+              Just p -> pure (Just p)
+              Nothing -> check es
+          else
+            if e == target || e == target <.> "exe"
+              then pure (Just full)
+              else check es
+  check entries
+
 installTool :: Tool -> IO ()
 installTool tool = do
   let name = toolName tool
@@ -163,9 +209,24 @@ installTool tool = do
   case pickAsset rel of
     Just asset -> do
       putStrLn $ "  Downloading " ++ assetName asset ++ " (" ++ relTagName rel ++ ")..."
-      downloadAsset asset destPath
-      makeExecutable destPath
-      putStrLn $ "  Installed " ++ name ++ " " ++ relTagName rel ++ " to " ++ destPath
+      if isArchive (assetName asset)
+        then withSystemTempDirectory "bechmlup" $ \tmpDir -> do
+          let archivePath = tmpDir </> assetName asset
+          downloadAsset asset archivePath
+          putStrLn "  Extracting..."
+          extractArchive archivePath tmpDir
+          found <- findFileRecursive name tmpDir
+          case found of
+            Just exePath -> do
+              copyFile exePath destPath
+              makeExecutable destPath
+              putStrLn $ "  Installed " ++ name ++ " " ++ relTagName rel ++ " to " ++ destPath
+            Nothing ->
+              fail $ "Could not find " ++ name ++ " executable in archive " ++ assetName asset
+        else do
+          downloadAsset asset destPath
+          makeExecutable destPath
+          putStrLn $ "  Installed " ++ name ++ " " ++ relTagName rel ++ " to " ++ destPath
     Nothing ->
       fail $ "No matching asset for platform '" ++ platformSuffix ++ "' in release " ++ relTagName rel
 

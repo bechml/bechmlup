@@ -6,7 +6,8 @@ set -euo pipefail
 
 REPO="bechml/bechmlup"
 INSTALL_DIR="$HOME/.bechmlup/bin"
-API_URL="https://api.github.com/repos/${REPO}/releases/latest"
+# Use /releases (not /releases/latest) to include prereleases
+API_URL="https://api.github.com/repos/${REPO}/releases?per_page=1"
 
 info()  { printf "\033[1;34m==> %s\033[0m\n" "$*"; }
 warn()  { printf "\033[1;33mwarning: %s\033[0m\n" "$*"; }
@@ -38,33 +39,54 @@ fetch_latest_release() {
   info "Fetching latest bechmlup release..."
 
   if command -v curl &>/dev/null; then
-    RELEASE_JSON="$(curl -sSf -H "User-Agent: bechmlup-installer" "$API_URL" 2>/dev/null)" || true
+    RELEASE_JSON="$(curl -sSf -H 'User-Agent: bechmlup-installer' "$API_URL" 2>/dev/null)" || true
   elif command -v wget &>/dev/null; then
-    RELEASE_JSON="$(wget -qO- --header="User-Agent: bechmlup-installer" "$API_URL" 2>/dev/null)" || true
+    RELEASE_JSON="$(wget -qO- --header='User-Agent: bechmlup-installer' "$API_URL" 2>/dev/null)" || true
   else
     error "Neither curl nor wget found. Please install one of them."
   fi
 
-  if [ -z "${RELEASE_JSON:-}" ] || [ "$RELEASE_JSON" = "null" ]; then
+  if [ -z "${RELEASE_JSON:-}" ] || [ "$RELEASE_JSON" = "[]" ] || [ "$RELEASE_JSON" = "null" ]; then
     warn "No releases found yet for bechmlup."
-    warn "Releases have not been published yet."
     warn "Building from source instead..."
     install_from_source
     return 1
   fi
 
-  TAG="$(echo "$RELEASE_JSON" | grep '"tag_name"' | head -1 | sed 's/.*: *"\(.*\)".*/\1/')"
+  # Parse tag_name from JSON
+  if command -v jq &>/dev/null; then
+    TAG="$(echo "$RELEASE_JSON" | jq -r '.[0].tag_name // empty')"
+  else
+    # Careful: match only the top-level "tag_name" field, not text inside body
+    TAG="$(echo "$RELEASE_JSON" | tr ',' '\n' | grep '"tag_name"' | head -1 | sed 's/.*"tag_name" *: *"\([^"]*\)".*/\1/')"
+  fi
+
+  if [ -z "$TAG" ]; then
+    warn "Could not determine release tag."
+    warn "Building from source instead..."
+    install_from_source
+    return 1
+  fi
+
   info "Latest release: $TAG"
   return 0
 }
 
 find_asset_url() {
-  # Try to find a matching asset for our platform
-  ASSET_URL="$(echo "$RELEASE_JSON" \
-    | grep '"browser_download_url"' \
-    | grep -i "$OS" \
-    | head -1 \
-    | sed 's/.*: *"\(.*\)".*/\1/')"
+  # Find the download URL for our platform
+  if command -v jq &>/dev/null; then
+    ASSET_URL="$(echo "$RELEASE_JSON" | jq -r \
+      ".[0].assets[] | select(.name | test(\"$OS\"; \"i\")) | .browser_download_url" \
+      | head -1)"
+  else
+    # Extract all browser_download_url values, then filter by OS
+    ASSET_URL="$(echo "$RELEASE_JSON" \
+      | tr ',' '\n' \
+      | grep '"browser_download_url"' \
+      | grep -i "$OS" \
+      | head -1 \
+      | sed 's/.*"browser_download_url" *: *"\([^"]*\)".*/\1/')"
+  fi
 
   if [ -z "$ASSET_URL" ]; then
     warn "No prebuilt binary found for $PLATFORM."
@@ -84,13 +106,66 @@ download_binary() {
     dest="$INSTALL_DIR/bechmlup.exe"
   fi
 
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+
+  local asset_name
+  asset_name="$(basename "$ASSET_URL")"
+  local archive_path="$tmpdir/$asset_name"
+
+  info "Saving to $archive_path"
   if command -v curl &>/dev/null; then
-    curl -sSfL -o "$dest" "$ASSET_URL"
+    curl -sSfL -o "$archive_path" "$ASSET_URL"
   else
-    wget -qO "$dest" "$ASSET_URL"
+    wget -qO "$archive_path" "$ASSET_URL"
   fi
 
+  # Check if it's an archive and extract, or just a raw binary
+  case "$asset_name" in
+    *.tar.gz|*.tgz)
+      info "Extracting $asset_name..."
+      tar xzf "$archive_path" -C "$tmpdir"
+      ;;
+    *.zip)
+      info "Extracting $asset_name..."
+      if command -v unzip &>/dev/null; then
+        unzip -o -q "$archive_path" -d "$tmpdir"
+      else
+        tar xf "$archive_path" -C "$tmpdir"
+      fi
+      ;;
+    *)
+      # Raw binary, just move it
+      cp "$archive_path" "$dest"
+      chmod +x "$dest"
+      rm -rf "$tmpdir"
+      info "Installed bechmlup to $dest"
+      return 0
+      ;;
+  esac
+
+  # Find the executable in extracted files
+  local exe_name="bechmlup"
+  if [ "$OS" = "windows" ]; then
+    exe_name="bechmlup.exe"
+  fi
+
+  local found
+  found="$(find "$tmpdir" -name "$exe_name" -type f 2>/dev/null | head -1)"
+
+  if [ -z "$found" ]; then
+    # Fallback: look for any executable file
+    found="$(find "$tmpdir" -type f -executable 2>/dev/null | head -1)"
+  fi
+
+  if [ -z "$found" ]; then
+    rm -rf "$tmpdir"
+    error "Could not find bechmlup executable in archive $asset_name"
+  fi
+
+  cp "$found" "$dest"
   chmod +x "$dest"
+  rm -rf "$tmpdir"
   info "Installed bechmlup to $dest"
 }
 
